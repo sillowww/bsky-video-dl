@@ -3,7 +3,7 @@ name = "bsky-video-dl"
 version = "0.1.0"
 edition = "2024"
 description = "wasm-based bluesky video downloader"
-repository = "https://github.com/sillowww/bsky-video-dl-rs"
+repository = "https://github.com/sillowww/bsky-video-dl"
 license = "AGPL-3.0-or-later"
 
 [lib]
