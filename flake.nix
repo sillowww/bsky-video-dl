@@ -27,6 +27,7 @@
             binaryen
             pkg-config
             openssl
+            bun
           ];
         };
       }
