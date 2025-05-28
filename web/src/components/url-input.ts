@@ -80,10 +80,34 @@ class UrlInput extends HTMLElement {
         this.errorMsg.textContent = "no video found in this post.";
       }
     } catch (error) {
-      this.errorMsg.textContent =
-        error instanceof Error
-          ? error.message
-          : "failed to check url. make sure it's a valid bluesky post.";
+      let errorMessage = "failed to check url.";
+      console.error("error details:", error);
+
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      } else if (typeof error === "string") {
+        errorMessage = error;
+      } else if (error && typeof error === "object") {
+        const errorObj = error as {
+          message?: unknown;
+          toString?: () => string;
+        };
+        if (typeof errorObj.message === "string" && errorObj.message) {
+          errorMessage = errorObj.message;
+        } else if (typeof errorObj.toString === "function") {
+          errorMessage = errorObj.toString();
+        }
+      }
+
+      if (
+        errorMessage === "failed to check url." ||
+        errorMessage === "Error" ||
+        errorMessage.includes("unreachable")
+      ) {
+        errorMessage = "failed to check url. make sure it's a valid bsky post.";
+      }
+
+      this.errorMsg.textContent = errorMessage;
     } finally {
       this.button.disabled = false;
       this.button.textContent = "check";

@@ -36,20 +36,38 @@ async fn resolve_handle_to_did(handle: &str) -> Result<String, JsValue> {
 
     let response = client.get(&resolve_url).send().await.map_err(|e| {
         console_error!("failed to resolve handle: {}", e);
-        JsValue::from_str(&format!("failed to resolve handle: {}", e))
+        JsValue::from_str(&format!(
+            "unable to resolve handle '{}'. check that the handle exists.",
+            handle
+        ))
     })?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        return Err(JsValue::from_str(&format!(
-            "handle resolution failed with status: {}",
-            status
-        )));
+        let error_msg = match status {
+            400 => format!("uanble to resolve handle '{}'.", handle),
+            404 => format!("handle '{}' not found.", handle),
+            429 => "too many requests. please try again later.".to_string(),
+            500..=599 => "bluesky servers are having issues. please try again later.".to_string(),
+            _ => format!(
+                "failed to resolve handle '{}' (status: {}).",
+                handle, status
+            ),
+        };
+        console_error!(
+            "handle resolution failed with status {}: {}",
+            status,
+            error_msg
+        );
+        return Err(JsValue::from_str(&error_msg));
     }
 
     let resolve_response: ResolveResponse = response.json().await.map_err(|e| {
         console_error!("failed to parse resolve response: {}", e);
-        JsValue::from_str(&format!("failed to parse resolve response: {}", e))
+        JsValue::from_str(&format!(
+            "invalid response when resolving handle '{}'.",
+            handle
+        ))
     })?;
 
     console_log!("resolved DID: {}", resolve_response.did);
@@ -80,10 +98,20 @@ pub async fn get_video_info(post_url: &str) -> Result<JsValue, JsValue> {
         .await
         .map_err(|e| JsValue::from_str(&format!("failed to fetch post: {}", e)))?;
 
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let error_msg = match status {
+            404 => "post not found. check that the URL is correct.".to_string(),
+            400 => "invalid post URL.".to_string(),
+            _ => format!("failed to fetch post (status: {}).", status),
+        };
+        return Err(JsValue::from_str(&error_msg));
+    }
+
     let api_response: ApiResponse = response
         .json()
         .await
-        .map_err(|e| JsValue::from_str(&format!("failed to parse post: {}", e)))?;
+        .map_err(|_| JsValue::from_str("invalid post data received."))?;
 
     let embed = api_response
         .value
@@ -125,7 +153,17 @@ pub async fn get_video_info(post_url: &str) -> Result<JsValue, JsValue> {
 pub async fn check_has_video(post_url: &str) -> Result<bool, JsValue> {
     match get_video_info(post_url).await {
         Ok(_) => Ok(true),
-        Err(_) => Ok(false),
+        Err(e) => {
+            let error_str = e.as_string().unwrap_or_default();
+            if error_str.contains("no embed found")
+                || error_str.contains("not a video post")
+                || error_str.contains("no video data")
+            {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
