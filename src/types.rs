@@ -39,8 +39,3 @@ pub struct BlobRef {
     #[serde(rename = "$link")]
     pub cid: String,
 }
-
-#[derive(Deserialize, Debug)]
-pub struct ResolveResponse {
-    pub did: String,
-}

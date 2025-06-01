@@ -1,4 +1,5 @@
 use js_sys::*;
+use serde_json::Value as JsonValue;
 use wasm_bindgen::prelude::*;
 
 mod types;
@@ -25,53 +26,79 @@ async fn resolve_handle_to_did(handle: &str) -> Result<String, JsValue> {
     if handle.is_empty() {
         return Err(JsValue::from_str("handle cannot be empty"));
     }
-
     let client = create_http_client()?;
-    let resolve_url = format!(
-        "https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={}",
+    let url = format!(
+        "https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor={}",
         handle.trim()
     );
+    console_log!("resolving handle via public.api.bsky.app: {}", handle);
 
-    console_log!("resolving handle: {}", handle);
+    let response = client.get(&url).send().await;
 
-    let response = client.get(&resolve_url).send().await.map_err(|e| {
-        console_error!("failed to resolve handle: {}", e);
-        JsValue::from_str(&format!(
-            "unable to resolve handle '{}'. check that the handle exists.",
-            handle
-        ))
-    })?;
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let error_msg = match status {
-            400 => format!("uanble to resolve handle '{}'.", handle),
-            404 => format!("handle '{}' not found.", handle),
-            429 => "too many requests. please try again later.".to_string(),
-            500..=599 => "bluesky servers are having issues. please try again later.".to_string(),
-            _ => format!(
-                "failed to resolve handle '{}' (status: {}).",
-                handle, status
-            ),
-        };
-        console_error!(
-            "handle resolution failed with status {}: {}",
-            status,
-            error_msg
-        );
-        return Err(JsValue::from_str(&error_msg));
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            let json: serde_json::Value = resp.json().await.map_err(|e| {
+                console_error!("failed to parse profile response: {}", e);
+                JsValue::from_str(&format!(
+                    "invalid response when resolving handle '{}'.",
+                    handle
+                ))
+            })?;
+            if let Some(did) = json.get("did").and_then(|v| v.as_str()) {
+                console_log!("resolved DID: {}", did);
+                Ok(did.to_string())
+            } else {
+                let msg = format!("profile response missing 'did' field for '{}'", handle);
+                console_error!("{}", msg);
+                Err(JsValue::from_str(&msg))
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            let msg = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(message) = json.get("message").and_then(|m| m.as_str()) {
+                    format!("unable to resolve handle (status {}): {}", status, message)
+                } else {
+                    format!("unable to resolve handle (status {}): {}", status, text)
+                }
+            } else {
+                format!("unable to resolve handle (status {}): {}", status, text)
+            };
+            console_error!("{}", msg);
+            Err(JsValue::from_str(&msg))
+        }
+        Err(e) => {
+            let msg = format!("network error while resolving handle: {}", e);
+            console_error!("{}", msg);
+            Err(JsValue::from_str(&msg))
+        }
     }
+}
 
-    let resolve_response: ResolveResponse = response.json().await.map_err(|e| {
-        console_error!("failed to parse resolve response: {}", e);
-        JsValue::from_str(&format!(
-            "invalid response when resolving handle '{}'.",
-            handle
-        ))
+async fn resolve_did_to_pds(did: &str) -> Result<String, JsValue> {
+    let url = format!("https://plc.directory/{}", did);
+    let client = create_http_client()?;
+    let response = client.get(&url).send().await.map_err(|e| {
+        console_error!("failed to fetch DID doc: {}", e);
+        JsValue::from_str(&format!("failed to fetch DID doc: {}", e))
     })?;
-
-    console_log!("resolved DID: {}", resolve_response.did);
-    Ok(resolve_response.did)
+    if !response.status().is_success() {
+        return Err(JsValue::from_str(&format!(
+            "failed to fetch DID doc (status: {})",
+            response.status().as_u16()
+        )));
+    }
+    let doc: JsonValue = response.json().await.map_err(|e| {
+        console_error!("invalid DID doc: {}", e);
+        JsValue::from_str(&format!("invalid DID doc: {}", e))
+    })?;
+    let endpoint = doc["service"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|svc| svc["id"] == "#atproto_pds"))
+        .and_then(|svc| svc["serviceEndpoint"].as_str())
+        .ok_or_else(|| JsValue::from_str("no PDS endpoint found in DID doc"))?;
+    Ok(endpoint.to_string())
 }
 
 fn create_http_client() -> Result<reqwest::Client, JsValue> {
@@ -85,10 +112,10 @@ fn create_http_client() -> Result<reqwest::Client, JsValue> {
 pub async fn get_video_info(post_url: &str) -> Result<JsValue, JsValue> {
     console_log!("getting video info for URL: {}", post_url);
 
-    let (did, rkey) = parse_bsky_url(post_url).await?;
+    let (did, rkey, pds_base) = resolve_post_url(post_url).await?;
     let record_url = format!(
-        "https://bsky.social/xrpc/com.atproto.repo.getRecord?repo={}&collection=app.bsky.feed.post&rkey={}",
-        did, rkey
+        "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=app.bsky.feed.post&rkey={}",
+        pds_base, did, rkey
     );
 
     let client = create_http_client()?;
@@ -171,12 +198,12 @@ pub async fn check_has_video(post_url: &str) -> Result<bool, JsValue> {
 pub async fn download_video(post_url: &str) -> Result<Vec<u8>, JsValue> {
     console_log!("starting video download for URL: {}", post_url);
 
-    let (did, rkey) = parse_bsky_url(post_url).await?;
-    console_log!("parsed DID: {}, RKey: {}", did, rkey);
+    let (did, rkey, pds_base) = resolve_post_url(post_url).await?;
+    console_log!("parsed DID: {}, RKey: {}, PDS: {}", did, rkey, pds_base);
 
     let record_url = format!(
-        "https://bsky.social/xrpc/com.atproto.repo.getRecord?repo={}&collection=app.bsky.feed.post&rkey={}",
-        did, rkey
+        "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=app.bsky.feed.post&rkey={}",
+        pds_base, did, rkey
     );
 
     let client = create_http_client()?;
@@ -229,8 +256,8 @@ pub async fn download_video(post_url: &str) -> Result<Vec<u8>, JsValue> {
 
     // download the blob
     let blob_url = format!(
-        "https://bsky.social/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
-        did, video.blob_ref.cid
+        "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
+        pds_base, did, video.blob_ref.cid
     );
 
     console_log!("downloading video blob...");
@@ -257,7 +284,7 @@ pub async fn download_video(post_url: &str) -> Result<Vec<u8>, JsValue> {
     Ok(bytes.to_vec())
 }
 
-async fn parse_bsky_url(url: &str) -> Result<(String, String), JsValue> {
+fn parse_bsky_url(url: &str) -> Result<(String, String), JsValue> {
     let url = url.trim();
 
     if url.is_empty() {
@@ -276,7 +303,6 @@ async fn parse_bsky_url(url: &str) -> Result<(String, String), JsValue> {
 
     let parts: Vec<&str> = url.split('/').collect();
 
-    // find profile & post indices
     let profile_idx = parts
         .iter()
         .position(|&x| x == "profile")
@@ -297,7 +323,6 @@ async fn parse_bsky_url(url: &str) -> Result<(String, String), JsValue> {
         return Err(JsValue::from_str("no post ID found after 'post' in URL"));
     }
 
-    // ensure post comes after profile
     if post_idx <= profile_idx {
         return Err(JsValue::from_str(
             "invalid URL structure: 'post' must come after 'profile'",
@@ -307,7 +332,6 @@ async fn parse_bsky_url(url: &str) -> Result<(String, String), JsValue> {
     let handle_or_did = parts[profile_idx + 1];
     let rkey = parts[post_idx + 1];
 
-    // validation
     if handle_or_did.is_empty() {
         return Err(JsValue::from_str("handle/DID cannot be empty"));
     }
@@ -316,51 +340,27 @@ async fn parse_bsky_url(url: &str) -> Result<(String, String), JsValue> {
         return Err(JsValue::from_str("post ID cannot be empty"));
     }
 
-    // resolve handle to DID
-    let did = if handle_or_did.starts_with("did:") {
-        console_log!("using provided DID: {}", handle_or_did);
-        handle_or_did.to_string()
-    } else {
-        console_log!("resolving handle to DID: {}", handle_or_did);
-        resolve_handle_to_did(handle_or_did).await?
-    };
-
-    Ok((did, rkey.to_string()))
+    Ok((handle_or_did.to_string(), rkey.to_string()))
 }
 
-#[wasm_bindgen]
-pub async fn resolve_handle(handle: &str) -> Result<String, JsValue> {
-    resolve_handle_to_did(handle).await
+async fn resolve_post_url(url: &str) -> Result<(String, String, String), JsValue> {
+    let (handle_or_did, rkey) = parse_bsky_url(url)?;
+    let did = if handle_or_did.starts_with("did:") {
+        console_log!("using provided DID: {}", handle_or_did);
+        handle_or_did
+    } else {
+        console_log!("resolving handle to DID: {}", handle_or_did);
+        resolve_handle_to_did(&handle_or_did).await?
+    };
+    let pds = resolve_did_to_pds(&did).await?;
+    Ok((did, rkey, pds))
 }
 
 #[wasm_bindgen]
 pub fn parse_url(url: &str) -> Result<js_sys::Array, JsValue> {
-    let url = url.trim();
-
-    if url.is_empty() {
-        return Err(JsValue::from_str("URL cannot be empty"));
-    }
-
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(JsValue::from_str("URL must start with http:// or https://"));
-    }
-
-    if !url.contains("/profile/") || !url.contains("/post/") {
-        return Err(JsValue::from_str(
-            "invalid URL format. expected format: https://{domain}/profile/{handle}/post/{rkey}",
-        ));
-    }
-
-    let parts: Vec<&str> = url.split('/').collect();
-    let profile_idx = parts.iter().position(|&x| x == "profile").unwrap();
-    let post_idx = parts.iter().position(|&x| x == "post").unwrap();
-
-    let handle_or_did = parts[profile_idx + 1];
-    let rkey = parts[post_idx + 1];
-
+    let (handle_or_did, rkey) = parse_bsky_url(url)?;
     let result = js_sys::Array::new();
-    result.push(&JsValue::from_str(handle_or_did));
-    result.push(&JsValue::from_str(rkey));
-
+    result.push(&JsValue::from_str(&handle_or_did));
+    result.push(&JsValue::from_str(&rkey));
     Ok(result)
 }
