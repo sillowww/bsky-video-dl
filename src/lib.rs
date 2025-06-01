@@ -77,7 +77,16 @@ async fn resolve_handle_to_did(handle: &str) -> Result<String, JsValue> {
 }
 
 async fn resolve_did_to_pds(did: &str) -> Result<String, JsValue> {
-    let url = format!("https://plc.directory/{}", did);
+    let url = if did.starts_with("did:web:") {
+        let domain = &did[8..];
+        let path = domain.replace(':', "/");
+        format!("https://{}/.well-known/did.json", path)
+    } else if did.starts_with("did:plc:") {
+        format!("https://plc.directory/{}", did)
+    } else {
+        return Err(JsValue::from_str("unsupported DID method"));
+    };
+
     let client = create_http_client()?;
     let response = client.get(&url).send().await.map_err(|e| {
         console_error!("failed to fetch DID doc: {}", e);
